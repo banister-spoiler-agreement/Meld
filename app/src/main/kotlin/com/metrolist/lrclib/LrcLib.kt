@@ -11,6 +11,9 @@ import io.ktor.client.plugins.defaultRequest
 import io.ktor.client.request.get
 import io.ktor.client.request.parameter
 import io.ktor.serialization.kotlinx.json.json
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.serialization.json.Json
@@ -71,6 +74,35 @@ object LrcLib {
         }
         return cleaned.trim()
     }
+
+    private const val MAX_REFRESHED_CANDIDATES = 5
+
+    /**
+     * `/api/search` can serve stale copies of recently updated entries (old text,
+     * `hasWordSync = false`, no `lyricsfile`), while `/api/get/{id}` is always current.
+     * Re-fetch, in parallel, only the candidates that can actually be selected (within the ±5s
+     * duration window, or the first few when the duration is unknown), keeping search order.
+     */
+    private suspend fun refreshCandidates(tracks: List<Track>, duration: Int): List<Track> {
+        val candidates = if (duration == -1) {
+            tracks
+        } else {
+            tracks.filter { abs(it.duration.toInt() - duration) <= 5 }
+                .sortedBy { abs(it.duration.toInt() - duration) }
+        }.take(MAX_REFRESHED_CANDIDATES)
+        if (candidates.isEmpty()) return tracks
+
+        val fresh = coroutineScope {
+            candidates.map { track ->
+                async { runCatching { client.get("/api/get/${track.id}").body<Track>() }.getOrNull() }
+            }.awaitAll()
+        }.filterNotNull().associateBy { it.id }
+        return tracks.map { fresh[it.id] ?: it }
+    }
+
+    /** Word-synced lyrics from the Lyricsfile when available, else synced, else plain. */
+    private fun Track.displayLyrics(): String? =
+        (if (hasWordSync) Lyricsfile.toWordSyncedLrc(lyricsfile) else null) ?: syncedLyrics ?: plainLyrics
 
     private suspend fun queryLyricsWithParams(
         trackName: String? = null,
@@ -141,20 +173,20 @@ object LrcLib {
         duration: Int,
         album: String? = null,
     ) = runCatching {
-        val tracks = queryLyrics(artist, title, album)
+        val tracks = refreshCandidates(queryLyrics(artist, title, album), duration)
         val cleanedTitle = cleanTitle(title)
         val cleanedArtist = cleanArtist(artist)
 
         val res = when {
             duration == -1 -> {
                 tracks.bestMatchingFor(duration, cleanedTitle, cleanedArtist)?.let { track ->
-                    track.syncedLyrics ?: track.plainLyrics
+                    track.displayLyrics()
                 }?.let(LrcLib::Lyrics)
             }
             else -> {
                 // Try with relaxed duration matching (±5 seconds instead of ±2)
                 tracks.bestMatchingForRelaxed(duration)?.let { track ->
-                    track.syncedLyrics ?: track.plainLyrics
+                    track.displayLyrics()
                 }?.let(LrcLib::Lyrics)
             }
         }
@@ -173,7 +205,7 @@ object LrcLib {
         album: String? = null,
         callback: (String) -> Unit,
     ) {
-        val tracks = queryLyrics(artist, title, album)
+        val tracks = refreshCandidates(queryLyrics(artist, title, album), duration)
         val cleanedTitle = cleanTitle(title)
         val cleanedArtist = cleanArtist(artist)
         var count = 0
@@ -194,7 +226,7 @@ object LrcLib {
                 }
             }
             else -> {
-                tracks.sortedBy { abs(it.duration.toInt() - duration) }
+                tracks.sortedWith(compareBy<Track>({ abs(it.duration.toInt() - duration) }, { !it.hasWordSync }))
             }
         }
 
@@ -203,12 +235,12 @@ object LrcLib {
             if (count <= 4) {
                 if (track.syncedLyrics != null && duration == -1) {
                     count++
-                    track.syncedLyrics.let(callback)
+                    callback(track.displayLyrics() ?: track.syncedLyrics)
                 } else {
                     // Relaxed duration matching (±5 seconds)
                     if (track.syncedLyrics != null && abs(track.duration.toInt() - duration) <= 5) {
                         count++
-                        track.syncedLyrics.let(callback)
+                        callback(track.displayLyrics() ?: track.syncedLyrics)
                     }
                     if (track.plainLyrics != null && abs(track.duration.toInt() - duration) <= 5 && plain == 0) {
                         count++
